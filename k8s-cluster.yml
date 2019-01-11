@@ -1,0 +1,202 @@
+- name: Setup nodes for K8s in GCP
+  hosts: localhost
+  connection: local
+  gather_facts: no
+  vars_files:
+    - gcp-vars.yml
+  vars:
+    gcp_instances:
+      - name: k8s-master-1
+        group: master
+      - name: k8s-worker-1
+        group: worker
+  tags:
+    - gcp
+
+  tasks:
+    - name: Create k8s nodes
+      loop: "{{ gcp_instances }}"
+      gcp_compute_instance:
+        state: present
+        project: "{{ gcp.project }}"
+        auth_kind: "{{ gcp.auth_kind }}"
+        service_account_file: "{{ gcp.service_account_file }}"
+        scopes: "{{ gcp.scopes }}"
+        name: "{{ item.name }}"
+        machine_type: n1-standard-2
+        zone: "{{ gcp.zone }}"
+        can_ip_forward: no
+        disks:
+          - boot: yes
+            auto_delete: yes
+            initialize_params:
+              source_image: projects/ubuntu-os-cloud/global/images/family/ubuntu-1804-lts
+              disk_size_gb: 10
+        network_interfaces:
+          - access_configs:
+              - name: 'External NAT'
+                type: 'ONE_TO_ONE_NAT'
+        scheduling:
+          preemptible: yes
+        metadata:
+          project: k8s-test
+          group: "{{ item.group }}"
+          startup_script: |
+            #!/bin/bash -e
+            export DEBIAN_FRONTEND=noninteractive
+            swapoff -a
+      register: k8s_nodes
+
+    - name: Wait for SSH to come up
+      loop: "{{ k8s_nodes.results }}"
+      wait_for:
+        host: "{{ item.networkInterfaces[0].accessConfigs[0].natIP }}"
+        port: 22
+        delay: 1
+        timeout: 90
+
+    - name: Add host to group
+      loop: "{{ k8s_nodes.results }}"
+      add_host:
+        hostname: "{{ item.networkInterfaces[0].accessConfigs[0].natIP }}"
+        groupname: "{{ item.metadata.group }}"
+
+- name: Prepare all nodes for K8s
+  hosts: master:worker
+  become: true
+  become_method: sudo
+  tags:
+    - k8s-node
+  tasks:
+    - name: Add Kubernetes repo key
+      apt_key:
+        url: https://packages.cloud.google.com/apt/doc/apt-key.gpg
+
+    - name: Add Kubernetes repo
+      apt_repository:
+        repo: deb http://apt.kubernetes.io/ kubernetes-xenial main
+
+    - name: Upgrade existing packages
+      apt:
+        update_cache: yes
+        upgrade: yes
+
+    - name: Install Docker
+      apt:
+        name: docker.io
+
+    - name: Start Docker
+      systemd:
+        name: docker
+        enabled: true
+        state: started
+
+    - name: Install Kubernetes tools
+      apt:
+        name: "{{ item }}"
+      loop:
+        - kubeadm=1.12.2-00
+        - kubelet=1.12.2-00
+        - kubectl=1.12.2-00
+
+- name: Prepare K8s master
+  hosts: master
+  tags:
+    - k8s-master
+  tasks:
+    - name: Path for kubeconfig directory
+      set_fact:
+        kube_dir: "{{ lookup('env', 'HOME') }}/.kube"
+
+    - name: Create directory for kubeconfig
+      file:
+        state: directory
+        path: "{{ kube_dir }}"
+
+    - become: true
+      become_method: sudo
+      block:
+        - name: Check if Kubernetes is running
+          command: >
+            kubectl --kubeconfig /etc/kubernetes/admin.conf get nodes
+          register: check_k8s
+          failed_when: false
+          changed_when: false
+
+        - name: Initialize Kubernetes
+          when: check_k8s.rc != 0
+          command: >
+            kubeadm init --pod-network-cidr 192.168.0.0/16
+
+        - name: Copy kubeconfig
+          copy:
+            src: /etc/kubernetes/admin.conf
+            dest: "{{ kube_dir }}/config"
+            remote_src: true
+
+        - name: Update kubeconfig permissions
+          file:
+            path: "{{ kube_dir }}/config"
+            owner: "{{ lookup('env', 'USER') }}"
+            group: "{{ lookup('pipe', 'id -g') }}"
+
+    - name: Fetch Calico RBAC
+      get_url:
+        url: https://docs.projectcalico.org/v3.3/getting-started/kubernetes/installation/hosted/rbac-kdd.yaml
+        dest: ~/calico-rbac-kdd.yaml
+
+    - name: Fetch Calico
+      get_url:
+        url: https://docs.projectcalico.org/v3.3/getting-started/kubernetes/installation/hosted/kubernetes-datastore/calico-networking/1.7/calico.yaml
+        dest: ~/calico.yaml
+
+    - name: Install Calico RBAC
+      command: >
+        kubectl apply -f ~/calico-rbac-kdd.yaml
+
+    - name: Install Calico
+      command: >
+        kubectl apply -f ~/calico.yaml
+
+- name: Prepare K8s worker
+  hosts: worker
+  tags:
+    - k8s-worker
+  vars:
+    master_node: "{{ groups['master'][0] }}"
+  tasks:
+    - name: Get join details
+      become: true
+      become_method: sudo
+      delegate_to: "{{ master_node }}"
+      block:
+        - name: Store master node private IP address
+          set_fact:
+            master_ip: "{{ hostvars[master_node]['ansible_all_ipv4_addresses'] | ipaddr('10.0.0.0/8') | first }}"
+
+        - name: Generate Kubernetes join token
+          command: >
+            kubeadm token create
+          register: k8s_token
+
+        - name: Get Discovery Token CA Cert hash
+          shell: >
+            openssl x509 -pubkey -in /etc/kubernetes/pki/ca.crt |
+            openssl rsa -pubin -outform der 2>/dev/null |
+            openssl dgst -sha256 -hex | sed 's/^.* //'
+          register: discovery_token_hash
+
+        - debug:
+            msg:
+              - "Master IP: {{ master_ip }}"
+              - "Token: {{ k8s_token.stdout }}"
+              - "Hash: {{ discovery_token_hash.stdout }}"
+
+    - name: Join to the K8s cluster
+      become: true
+      become_method: sudo
+      command: >
+        kubeadm join
+        --token {{ k8s_token.stdout }}
+        {{ master_ip }}:6443
+        --discovery-token-ca-cert-hash sha256:{{ discovery_token_hash.stdout }}
